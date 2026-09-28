@@ -1,0 +1,508 @@
+---
+lang: es
+execute-dir: file
+jupyter: python3
+execute:
+  echo: false
+  warning: false
+  message: false
+format:
+  pdf:
+    pdf-engine: xelatex
+    documentclass: scrreprt
+    geometry:
+      - top=2.1cm
+      - bottom=2.1cm
+      - left=2.2cm
+      - right=2.2cm
+    toc: false
+    number-sections: true
+    colorlinks: true
+    linkcolor: "UTBAzul"
+    urlcolor: "UTBAzul"
+    highlight-style: github
+    code-block-bg: "#F1F5F9"
+    code-block-border-left: "#0E7490"
+    include-in-header: header.tex
+---
+
+```{python}
+#| include: false
+import matplotlib.pyplot as plt
+import app_medicamentos as tablero
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "axes.labelcolor": "#405565",
+    "xtick.color": "#405565",
+    "ytick.color": "#405565",
+})
+```
+
+**Resumen ejecutivo.** Este documento presenta el diseño, la lógica de datos y la implementación de un tablero interactivo para explorar la dispensación de medicamentos de una EPS entre enero de 2020 y noviembre de 2021. La solución se desarrolló en Python con Dash; SQLite ejecuta las consultas agregadas, mientras que Pandas y Plotly apoyan el procesamiento y la visualización.
+
+La base contiene **28.482 registros**, **1.000 identificadores de persona** y **10.005 fórmulas distintas** en el periodo observado. El costo acumulado es de aproximadamente **$745,2 millones COP**. El tablero permite filtrar el resumen general por año, mes, grupo farmacológico y regional CAF, y presenta una sección específica de antidiabéticos.
+
+Una decisión importante de preparación fue recuperar la clasificación farmacológica que falta en algunos registros de 2020 usando la descripción del mismo medicamento en los registros que sí tienen grupo. Con esta regla, la base analítica identifica antidiabéticos en ambos años. Esto corrige una conclusión preliminar del borrador anterior, que trabajaba directamente con el campo sin normalizar y por eso concluía que no había registros de 2020.
+
+::: {.callout-note}
+## Lectura rápida
+El gasto domiciliario es la mayor categoría de entrega. La comparación anual debe interpretarse considerando que 2021 solo incluye registros hasta noviembre. Las cifras describen los datos observados y no establecen por sí solas causas clínicas o económicas.
+:::
+
+# Propósito y alcance
+
+## Problema y objetivo
+
+Una entidad de salud necesita consultar de forma ágil cuánto se dispensa, a cuántas personas y fórmulas corresponde, cómo cambia el gasto en el tiempo y dónde se concentra. Una revisión manual de registros individuales dificulta comparar periodos y aplicar varios filtros a la vez.
+
+El objetivo del tablero es convertir la tabla transaccional de dispensaciones en indicadores agregados y vistas interactivas que permitan responder preguntas descriptivas sobre costos, cobertura, medicamentos, grupos farmacológicos y logística de entrega.
+
+## Preguntas de análisis
+
+- ¿Cómo se distribuyen el costo, las personas y las fórmulas a través del tiempo?
+- ¿Qué medicamentos concentran el mayor costo?
+- ¿Cómo se reparte el gasto entre PBS y No PBS, departamentos y modalidades de entrega?
+- ¿Qué comportamiento presentan los antidiabéticos y cuáles medicamentos aportan más a su costo?
+- ¿Qué registros presentan información geográfica o de clasificación incompleta?
+
+## Alcance y unidad de análisis
+
+La unidad almacenada es el registro de dispensación de un medicamento. Un mismo identificador de persona (`id`) puede aparecer en varios registros y una fórmula puede incluir varios medicamentos. Por eso, los conteos de personas y fórmulas se calculan como valores distintos; no se deben interpretar como conteos de filas.
+
+El análisis cubre las fechas disponibles entre **2020-01-02 y 2021-11-30**. El costo se presenta en pesos colombianos (COP). El tablero es descriptivo y no realiza predicción ni recomienda tratamientos.
+
+# Datos y preparación
+
+## Fuente y estructura
+
+La fuente es `medicamentos.db`, una base SQLite que contiene la tabla `dispensacion`. Entre sus campos se usan `fecha_entrega`, `id`, `formula`, `descripcion`, `grupo_fco_economico`, `pbs`, `cantidad`, `costo_total`, `regional_caf`, `departamento_caf`, `municipio_caf` y `tipo_entrega`.
+
+La aplicación no carga la tabla completa en un DataFrame para atender cada interacción. Al cambiar filtros, abre una conexión SQLite, crea una vista temporal normalizada y solicita únicamente los agregados requeridos por el indicador o la gráfica.
+
+### Exploración del contenido de la base
+
+Antes de construir el tablero se inspeccionaron las tablas y columnas, el tamaño de la tabla principal, sus tipos de datos, cobertura temporal, valores faltantes y una muestra de registros. Esta lectura completa se usa solo para perfilar la fuente al documentarla; la aplicación conserva las consultas agregadas descritas en la metodología.
+
+```{python}
+#| include: false
+import sqlite3
+import pandas as pd
+
+conexion_perfil = sqlite3.connect(tablero.DB_PATH)
+tablas_bd = pd.read_sql_query(
+    "SELECT name AS Tabla FROM sqlite_master WHERE type='table' ORDER BY name",
+    conexion_perfil,
+)
+esquema_bd = pd.read_sql_query("PRAGMA table_info(dispensacion)", conexion_perfil)
+datos_bd = pd.read_sql_query("SELECT * FROM dispensacion", conexion_perfil)
+conexion_perfil.close()
+
+datos_bd["fecha_parseada"] = pd.to_datetime(datos_bd["fecha_entrega"], errors="coerce")
+fechas_validas = datos_bd["fecha_parseada"].dropna()
+resumen_bd = pd.DataFrame([
+    ("Base de datos", "medicamentos.db"),
+    ("Tablas disponibles", len(tablas_bd)),
+    ("Tabla analizada", "dispensacion"),
+    ("Registros", len(datos_bd)),
+    ("Columnas", len(esquema_bd)),
+    ("Fecha inicial", fechas_validas.min().strftime("%Y-%m-%d")),
+    ("Fecha final", fechas_validas.max().strftime("%Y-%m-%d")),
+], columns=["Característica", "Valor"])
+
+catalogo_bd = esquema_bd[["name", "type", "notnull", "pk"]].copy()
+catalogo_bd["Tipo observado"] = catalogo_bd["name"].map(
+    lambda campo: str(datos_bd[campo].dtype)
+)
+catalogo_bd = catalogo_bd.rename(columns={
+    "name": "Campo", "type": "Tipo declarado SQLite",
+    "notnull": "No nulo", "pk": "Clave primaria",
+})
+
+datos_crudos_bd = datos_bd.drop(columns="fecha_parseada")
+nulos_bd = pd.DataFrame({
+    "Campo": datos_crudos_bd.columns,
+    "Valores nulos": datos_crudos_bd.isna().sum().values,
+    "Cadenas vacías": datos_crudos_bd.apply(
+        lambda columna: columna.astype("string").str.strip().eq("").sum()
+    ).values,
+    "% nulos": (datos_crudos_bd.isna().mean().values * 100).round(2),
+})
+nulos_bd["% nulos o vacíos"] = (
+    (nulos_bd["Valores nulos"] + nulos_bd["Cadenas vacías"]) / len(datos_crudos_bd) * 100
+).round(2)
+nulos_bd = nulos_bd.sort_values(["Valores nulos", "Cadenas vacías"], ascending=False)
+
+muestra_bd = datos_crudos_bd[[
+    "fecha_entrega", "descripcion", "grupo_fco_economico", "tipo_entrega", "costo_total"
+]].head(6).copy()
+muestra_bd["descripcion"] = muestra_bd["descripcion"].fillna("").map(
+    lambda texto: texto if len(texto) <= 38 else texto[:35] + "..."
+)
+muestra_bd = muestra_bd.rename(columns={
+    "fecha_entrega": "Fecha", "descripcion": "Medicamento",
+    "grupo_fco_economico": "Grupo farmacológico", "tipo_entrega": "Modalidad",
+    "costo_total": "Costo (COP)",
+})
+
+estadisticas_bd = datos_crudos_bd[["cantidad", "costo_total"]].describe(
+    percentiles=[0.25, 0.5, 0.75]
+).T[["count", "mean", "std", "min", "25%", "50%", "75%", "max"]].round(2)
+estadisticas_bd.index.name = "Variable"
+estadisticas_bd = estadisticas_bd.rename(columns={
+    "count": "Registros", "mean": "Media", "std": "Desv. estándar",
+    "min": "Mínimo", "25%": "P25", "50%": "Mediana", "75%": "P75", "max": "Máximo",
+})
+```
+
+**Tablas disponibles y dimensiones**
+
+```{python}
+display(tablas_bd)
+display(resumen_bd)
+```
+
+**Esquema y tipos de datos**
+
+El tipo declarado corresponde al esquema de SQLite; el tipo observado es el inferido por Pandas a partir de los valores. “No nulo” y “Clave primaria” reflejan las restricciones declaradas en el esquema.
+
+```{python}
+display(catalogo_bd)
+```
+
+**Valores faltantes**
+
+Se muestran por separado los nulos SQL y las cadenas de texto vacías. Un código como `0` puede representar ausencia semántica aunque no sea nulo; en la aplicación se normaliza como `SIN REGISTRO` en campos geográficos.
+
+```{python}
+display(nulos_bd)
+```
+
+**Registros por año y porcentaje de nulos**
+
+```{python}
+#| label: fig-perfil-base
+#| fig-cap: "Volumen anual de filas y porcentaje de valores nulos o vacíos en los campos con más faltantes."
+#| fig-width: 8.2
+#| fig-height: 4.1
+registros_anio_bd = (
+    datos_bd.dropna(subset=["fecha_parseada"])
+    .assign(anio=lambda datos: datos["fecha_parseada"].dt.year)
+    .groupby("anio").size()
+)
+nulos_grafico_bd = nulos_bd[nulos_bd["% nulos o vacíos"] > 0].nlargest(
+    8, "% nulos o vacíos"
+).sort_values("% nulos o vacíos")
+fig, ejes = plt.subplots(1, 2, figsize=(8.2, 4.1), gridspec_kw={"width_ratios": [0.9, 1.5]})
+ejes[0].bar(registros_anio_bd.index.astype(str), registros_anio_bd.values,
+            color=["#164E63", "#D58A25"][:len(registros_anio_bd)])
+ejes[0].set_title("Registros por año")
+ejes[0].set_ylabel("Filas")
+ejes[0].grid(axis="y", color="#D9E2E8", linewidth=0.8)
+ejes[0].spines[["top", "right"]].set_visible(False)
+if not nulos_grafico_bd.empty:
+    ejes[1].barh(nulos_grafico_bd["Campo"], nulos_grafico_bd["% nulos o vacíos"], color="#C85C45")
+ejes[1].set_title("Campos con más nulos o vacíos")
+ejes[1].set_xlabel("Registros nulos o vacíos (%)")
+ejes[1].grid(axis="x", color="#D9E2E8", linewidth=0.8)
+ejes[1].spines[["top", "right", "left"]].set_visible(False)
+ejes[1].tick_params(axis="y", length=0, labelsize=8)
+fig.tight_layout()
+```
+
+**Muestra de registros**
+
+Se omiten los identificadores de persona y fórmula para no exponerlos en la muestra del informe.
+
+```{python}
+display(muestra_bd)
+```
+
+**Resumen de cantidad y costo**
+
+```{python}
+display(estadisticas_bd)
+```
+
+## Flujo de trabajo
+
+```{python}
+#| label: fig-flujo
+#| fig-cap: "Flujo desde la base transaccional hasta la interacción del usuario."
+#| fig-width: 8.2
+#| fig-height: 2.7
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+fig, ax = plt.subplots(figsize=(8.2, 2.7))
+ax.set_xlim(0, 10)
+ax.set_ylim(0, 3)
+ax.axis("off")
+flujo = [
+    (0.25, "SQLite\nmedicamentos.db", "#164E63"),
+    (2.65, "Vista SQL\nnormalización", "#087F8C"),
+    (5.05, "Consultas\nagregadas", "#D58A25"),
+    (7.45, "Dash + Plotly\ninteracción", "#C85C45"),
+]
+for x, texto, color in flujo:
+    caja = FancyBboxPatch((x, 1.05), 2.0, 1.0, boxstyle="round,pad=0.08,rounding_size=0.08",
+                          facecolor=color, edgecolor="none")
+    ax.add_patch(caja)
+    ax.text(x + 1.0, 1.55, texto, ha="center", va="center", color="white", fontsize=10, weight="bold")
+for x in (2.28, 4.68, 7.08):
+    ax.add_patch(FancyArrowPatch((x, 1.55), (x + 0.32, 1.55), arrowstyle="-|>", mutation_scale=15,
+                                 linewidth=1.7, color="#607D8B"))
+ax.text(5, 0.45, "Filtros del usuario → consultas SQL parametrizadas → indicadores y gráficas actualizados",
+        ha="center", va="center", fontsize=9, color="#405565")
+fig.tight_layout()
+```
+
+## Normalización aplicada por la vista temporal
+
+Antes de agregar, la vista temporal `d` deriva año, mes y periodo `AAAA-MM` desde `fecha_entrega`, y estandariza valores ausentes. Los campos regionales, departamento y municipio con nulos, texto vacío o código `0` se presentan como **SIN REGISTRO**; los tipos de entrega vacíos también se identifican explícitamente.
+
+Para el grupo farmacológico, la expresión `COALESCE(NULLIF(...), ...)` conserva el valor informado. Cuando falta, busca el grupo no vacío asociado a la misma descripción del medicamento. Si no encuentra clasificación, usa **SIN CLASIFICAR**. Esta regla recupera información útil para 2020, pero asume que una descripción corresponde a una clasificación consistente.
+
+## Calidad y límites
+
+En la vista usada por la aplicación, **1.241 de 28.482 registros (4,4%)** no tienen regional registrada y esa misma cantidad aparece sin departamento. En las gráficas geográficas se excluyen los municipios sin registro y el mapa utiliza coordenadas aproximadas mantenidas en el código; no es una geocodificación oficial.
+
+El conjunto de datos está incompleto para una comparación anual equivalente: el año 2020 tiene doce meses observados y 2021 llega hasta noviembre. Además, los nombres y categorías de origen dependen de la calidad de captura de la fuente. Los totales deben leerse con estas limitaciones y las observaciones deben validarse antes de tomar decisiones operativas.
+
+# Metodología del tablero
+
+## Consultas y filtros
+
+La función `consultar` abre una conexión SQLite, ejecuta la vista temporal y lee el resultado de una consulta específica. La función `donde` construye condiciones para año, mes, grupo y regional. Los valores seleccionados se pasan como parámetros `?`, evitando concatenar directamente sus valores dentro del SQL.
+
+```python
+# Ejemplo representativo de consulta agregada usada por los indicadores
+query = """
+SELECT COUNT(DISTINCT id) AS personas,
+       COUNT(DISTINCT formula) AS formulas,
+       COALESCE(SUM(costo_total), 0) AS costo,
+       COUNT(*) AS filas
+FROM d
+WHERE anio IN (?, ?) AND grupo IN (?)
+"""
+resultado = consultar(query, [2020, 2021, "ANTIDIABETICOS"])
+```
+
+Las columnas SQL incorporadas a las condiciones proceden de una lista interna controlada; los valores de los filtros se envían como parámetros. Cada gráfica consulta solo los campos y el nivel de agregación que necesita, en lugar de transportar la tabla completa al navegador.
+
+## Indicadores
+
+| Indicador | Definición implementada | Interpretación |
+|:--|:--|:--|
+| Personas con dispensación | `COUNT(DISTINCT id)` | Identificadores de persona en el subconjunto filtrado. |
+| Fórmulas distintas | `COUNT(DISTINCT formula)` | Fórmulas únicas presentes en los registros filtrados. |
+| Costo total | `SUM(costo_total)` | Suma del costo de las dispensaciones. |
+| Costo promedio por fórmula | Costo total / fórmulas distintas | Promedio agregado; no equivale al promedio del costo de una fila. |
+
+Si los filtros no devuelven registros, la app muestra ceros y gráficas vacías con un mensaje, evitando divisiones inválidas o visualizaciones engañosas.
+
+## Interfaz y callbacks
+
+La aplicación se construye con Dash y componentes Bootstrap. El callback del resumen general recibe las selecciones de los cuatro filtros y la métrica temporal; vuelve a ejecutar las consultas y actualiza en una sola respuesta los KPI, siete gráficas y la tabla de detalle.
+
+La vista **Resumen general** contiene:
+
+- Filtros multiselección de año, mes, grupo farmacológico y regional CAF.
+- KPI de personas, fórmulas, costo total y costo promedio por fórmula.
+- Serie mensual seleccionable entre costo, personas y fórmulas, con media móvil de tres meses.
+- Top 10 medicamentos por costo; participación PBS/No PBS; costo por departamento y modalidad de entrega.
+- Mapa de gasto municipal, treemap por grupo farmacológico y detalle de hasta 200 registros recientes.
+
+La gráfica de tipo de entrega conserva el desglose anual y añade una barra **Total 2020-2021** para cada modalidad. Ese total ignora el filtro de año, pero mantiene los filtros activos de mes, grupo y regional, de modo que puede compararse con el desglose sin perder el contexto elegido.
+
+## Análisis específico de antidiabéticos
+
+La segunda pestaña consulta el grupo **ANTIDIABETICOS** durante todo el periodo. Ignora los filtros generales de año, mes y grupo, pero conserva la selección de regional CAF. Presenta costo del grupo, costo promedio por fórmula, variación entre años comparables, medicamento de mayor costo, evolución mensual, participación de insulinas frente a medicamentos orales, top de medicamentos y una tabla de precio unitario.
+
+Para calcular la variación, el callback identifica los meses presentes en ambos años y compara el costo de esos mismos meses. La comparación del costo promedio por fórmula usa la misma ventana. Esta regla evita comparar, por ejemplo, doce meses de un año con once del otro; si no hay periodos comparables, la interfaz informa que no hay datos suficientes.
+
+# Resultados descriptivos
+
+## Panorama del periodo
+
+En el periodo disponible hay **28.482 filas**, **1.000 identificadores de persona distintos**, **10.005 fórmulas distintas** y un costo acumulado de aproximadamente **$745,2 millones COP**.
+
+| Año observado | Registros | Personas distintas en el año | Costo aproximado |
+|:--|--:|--:|--:|
+| 2020 | 13.475 | 684 | $438,5 millones |
+| 2021 (enero-noviembre) | 15.007 | 871 | $306,6 millones |
+
+Los conteos de personas por año se superponen: una persona puede aparecer en ambos años. Por esa razón, no se suman para obtener las 1.000 personas distintas del periodo completo. El costo de 2021 es parcial y no debe compararse como si cubriera doce meses.
+
+## Evolución mensual del costo
+
+```{python}
+#| label: fig-tendencia
+#| fig-cap: "Costo mensual de dispensación por año; 2021 incluye datos hasta noviembre."
+#| fig-width: 8.2
+#| fig-height: 4.2
+import pandas as pd
+from matplotlib.ticker import FuncFormatter
+
+mensual = tablero.consultar("""
+    SELECT anio, mes, ym, SUM(costo_total) AS costo
+    FROM d GROUP BY anio, mes, ym ORDER BY ym
+""")
+fig, ax = plt.subplots(figsize=(8.2, 4.2))
+colores_anio = {2020: "#164E63", 2021: "#D58A25"}
+for anio, grupo in mensual.groupby("anio"):
+    ax.plot(grupo["ym"], grupo["costo"] / 1e6, marker="o", linewidth=2.2,
+            markersize=4, label=str(anio), color=colores_anio.get(anio, "#087F8C"))
+ax.set_ylabel("Costo total (millones COP)")
+ax.set_xlabel("Mes de entrega")
+ax.yaxis.set_major_formatter(FuncFormatter(lambda valor, _: f"${valor:,.0f} M"))
+ax.grid(axis="y", color="#D9E2E8", linewidth=0.8)
+ax.spines[["top", "right"]].set_visible(False)
+ax.tick_params(axis="x", rotation=55, labelsize=8)
+ax.legend(title="Año", frameon=False, ncol=2, loc="upper right")
+fig.tight_layout()
+```
+
+La curva permite inspeccionar meses de mayor y menor gasto sin confundir el nivel mensual con un total anual. El tablero incluye una media móvil de tres meses como apoyo visual; esta suaviza fluctuaciones de corto plazo, pero no sustituye el valor mensual observado.
+
+## Medicamentos de mayor costo
+
+```{python}
+#| label: fig-top-medicamentos
+#| fig-cap: "Ocho medicamentos con mayor costo acumulado en el periodo disponible."
+#| fig-width: 8.2
+#| fig-height: 4.7
+import textwrap
+
+top_medicamentos = tablero.consultar("""
+    SELECT descripcion, SUM(costo_total) AS costo
+    FROM d GROUP BY descripcion ORDER BY costo DESC LIMIT 8
+""").sort_values("costo")
+fig, ax = plt.subplots(figsize=(8.2, 4.7))
+etiquetas = [textwrap.shorten(nombre, width=58, placeholder="…") for nombre in top_medicamentos["descripcion"]]
+barras = ax.barh(etiquetas, top_medicamentos["costo"] / 1e6, color="#087F8C", height=0.68)
+ax.bar_label(barras, fmt="$ %.1f M", padding=4, fontsize=8, color="#334155")
+ax.set_xlabel("Costo acumulado (millones COP)")
+ax.grid(axis="x", color="#D9E2E8", linewidth=0.8)
+ax.spines[["top", "right", "left"]].set_visible(False)
+ax.tick_params(axis="y", length=0, labelsize=8)
+ax.margins(x=0.18)
+fig.tight_layout()
+```
+
+La clasificación se ordena por suma de `costo_total`; no por precio unitario ni por número de dispensaciones. Para inspeccionar el nombre completo, la gráfica interactiva ofrece el detalle al pasar el cursor.
+
+## Modalidad de entrega
+
+```{python}
+#| label: fig-entregas
+#| fig-cap: "Costo por modalidad: barras anuales y total de todos los años disponibles."
+#| fig-width: 8.2
+#| fig-height: 4.5
+entrega_anual = tablero.consultar("""
+    SELECT entrega, CAST(anio AS TEXT) AS periodo, SUM(costo_total) AS costo
+    FROM d GROUP BY entrega, anio ORDER BY anio
+""")
+entrega_total = tablero.consultar("""
+    SELECT entrega, SUM(costo_total) AS costo
+    FROM d GROUP BY entrega
+""")
+entrega_total["periodo"] = "Total 2020-2021"
+entregas = pd.concat([entrega_anual, entrega_total], ignore_index=True)
+orden_periodos = ["2020", "2021", "Total 2020-2021"]
+modalidades = (entregas.groupby("entrega")["costo"].sum().sort_values(ascending=False).index.tolist())
+matriz = entregas.pivot(index="entrega", columns="periodo", values="costo").fillna(0)
+matriz = matriz.reindex(index=modalidades, columns=orden_periodos, fill_value=0) / 1e6
+fig, ax = plt.subplots(figsize=(8.2, 4.5))
+matriz.plot(kind="bar", ax=ax, color=["#164E63", "#D58A25", "#C85C45"], width=0.78)
+ax.set_ylabel("Costo (millones COP)")
+ax.set_xlabel("")
+ax.set_xticklabels(matriz.index, rotation=0)
+ax.grid(axis="y", color="#D9E2E8", linewidth=0.8)
+ax.spines[["top", "right", "left"]].set_visible(False)
+ax.legend(title="Periodo", frameon=False)
+ax.margins(y=0.16)
+fig.tight_layout()
+```
+
+La modalidad **DOMICILIARIO** acumula cerca de **$551,9 millones**; **PRESENCIAL**, **$191,4 millones**. Hay aproximadamente **$1,9 millones** en registros sin tipo de entrega. El agregado total suma los años completos que existen en la base y, en la app, se recalcula respetando los demás filtros seleccionados.
+
+## Enfoque en antidiabéticos
+
+```{python}
+#| label: fig-antidiabeticos
+#| fig-cap: "Costo mensual del grupo ANTIDIABETICOS según el año, con la clasificación normalizada por la app."
+#| fig-width: 8.2
+#| fig-height: 4.2
+anti_mensual = tablero.consultar("""
+    SELECT anio, mes, ym, SUM(costo_total) AS costo
+    FROM d WHERE grupo = 'ANTIDIABETICOS'
+    GROUP BY anio, mes, ym ORDER BY ym
+""")
+fig, ax = plt.subplots(figsize=(8.2, 4.2))
+for anio, grupo in anti_mensual.groupby("anio"):
+    ax.plot(grupo["mes"], grupo["costo"] / 1e6, marker="o", linewidth=2.2,
+            markersize=4, label=str(anio), color=colores_anio.get(anio, "#087F8C"))
+ax.set_xticks(range(1, 13), ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"])
+ax.set_ylabel("Costo mensual (millones COP)")
+ax.set_xlabel("Mes")
+ax.grid(axis="y", color="#D9E2E8", linewidth=0.8)
+ax.spines[["top", "right"]].set_visible(False)
+ax.legend(title="Año", frameon=False, ncol=2, loc="upper right")
+fig.tight_layout()
+```
+
+Con la clasificación normalizada, antidiabéticos acumula alrededor de **$72,9 millones** en el periodo: **603 registros en 2020** y **648 en 2021**. Estas cifras no corresponden a la consulta preliminar del borrador, que filtraba directamente el campo original y omitía categorías vacías. La sección interactiva compara los años solo sobre los meses que tienen observaciones en ambos.
+
+El medicamento de mayor costo acumulado en este grupo es la **insulina degludec en pluma prellenada**. El ranking es por costo total agregado; no implica que tenga el precio unitario más alto ni que sea el de mayor volumen de uso.
+
+# Uso del tablero
+
+1. Ejecutar la aplicación desde la carpeta que contiene `app_medicamentos.py` y `medicamentos.db`.
+2. En **Resumen general**, elegir uno o varios años, meses, grupos y regionales. Un filtro sin selección equivale a todos.
+3. Cambiar la métrica temporal entre costo, personas y fórmulas para actualizar la serie.
+4. Consultar gráficas, leyendas y detalles emergentes; las tablas muestran un máximo de 200 filas recientes.
+5. Abrir **Antidiabéticos** para revisar el análisis de todo el periodo, opcionalmente limitado por regional.
+
+El dashboard requiere conexión a internet para cargar las hojas de estilo externas y el mapa Carto usado en la vista interactiva. Las figuras de este informe son estáticas y se generan localmente durante el renderizado.
+
+# Instalación y reproducibilidad
+
+Desde la carpeta del proyecto, instalar las dependencias con:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Para ejecutar localmente:
+
+```bash
+python app_medicamentos.py
+```
+
+Para generar este informe en PDF se requiere Quarto, una distribución LaTeX compatible (por ejemplo, TinyTeX) y un kernel Jupyter de Python que tenga instalados los paquetes del proyecto. El render se ejecuta desde la carpeta del proyecto:
+
+```bash
+quarto render Tablero_medicamentos.qmd --to pdf
+```
+
+El código de ejecución se conserva en `app_medicamentos.py`; el PDF no duplica el archivo fuente. El enlace público de Posit está disponible en la portada y en este anexo. El archivo `Imagen1.jpg` debe permanecer junto al `.qmd` para que aparezca la identidad gráfica institucional.
+
+# Conclusiones
+
+- Dash ofrece una interfaz interactiva que combina filtros, KPI, gráficas y detalle transaccional sobre una base SQLite.
+- La agregación en SQL reduce la cantidad de datos que se traslada a la capa de visualización y permite recalcular resultados al cambiar filtros.
+- La estandarización de faltantes y la recuperación controlada del grupo farmacológico permiten una lectura más completa; la regla debe conservarse documentada y validarse con conocimiento del dominio.
+- El costo observado favorece la modalidad domiciliaria. Para comparar 2020 con 2021 se debe considerar que el segundo año no contiene diciembre.
+- El tablero apoya el análisis descriptivo, pero la calidad de registro, las ubicaciones aproximadas y el carácter observacional limitan las conclusiones causales u operativas.
+
+# Anexo A. Enlaces de acceso y código fuente
+
+El tablero se ejecuta desde la aplicación publicada en Posit. Abre el dashboard con este enlace:
+
+[Abrir el tablero de dispensación en Posit](https://01a0e88b-5124-bf26-d105-4bb9c7ce5b09.share.connect.posit.cloud/)
+
+El código fuente está disponible en GitHub:
+
+[Consultar `app_medicamentos.py` en GitHub](https://github.com/AngelVR23/Tablero_Dispensaci-n_medicamentos/blob/main/app_medicamentos.py)
