@@ -5,6 +5,7 @@ Dashboard interactivo para explorar los registros de dispensación de medicament
 ## Contenido del proyecto
 
 - `app_medicamentos.py`: aplicación Dash, consultas SQL y callbacks de interacción.
+- [Código fuente en GitHub](https://github.com/AngelVR23/Tablero_Dispensaci-n_medicamentos/blob/main/app_medicamentos.py).
 - `medicamentos.db`: base SQLite con la tabla `dispensacion`.
 - `requirements.txt`: dependencias de la aplicación y de las figuras del informe.
 - `Tablero_medicamentos.qmd`: informe reproducible, con metodología, resultados, gráficas y espacio para el enlace de ejecución.
@@ -50,11 +51,11 @@ Con Quarto y LaTeX instalados, y el kernel `python3` configurado para el entorno
 quarto render Tablero_medicamentos.qmd --to pdf
 ```
 
-Quarto crea `Tablero_medicamentos.pdf` en esta misma carpeta. `Imagen1.jpg`, `cover.tex` y `header.tex` deben permanecer junto al documento. Antes de renderizar, pega la URL pública de Posit en los espacios de acceso de la portada y del anexo. El informe no duplica el código fuente: este se conserva en `app_medicamentos.py`.
+Quarto crea `Tablero_medicamentos.pdf` en esta misma carpeta. `Imagen1.jpg`, `cover.tex` y `header.tex` deben permanecer junto al documento. La portada y el anexo enlazan a la aplicación pública de Posit. El informe no duplica el código fuente: este se conserva en `app_medicamentos.py`.
 
 ## Despliegue
 
-La aplicación expone el servidor Flask de Dash como `server` para facilitar despliegues WSGI. El comando o mecanismo de publicación depende del servicio escogido; configurar Posit manualmente según el producto y el método de publicación. `gunicorn` está incluido en los requisitos para plataformas que lo necesiten, pero no es necesario para ejecutar localmente con `python app_medicamentos.py`.
+La aplicación expone el servidor Flask de Dash como `server` para facilitar despliegues WSGI. El tablero publicado está en [Posit Connect](https://01a0e88b-5124-bf26-d105-4bb9c7ce5b09.share.connect.posit.cloud/), y el código fuente está enlazado en GitHub. El comando o mecanismo de publicación depende del servicio escogido; `gunicorn` está incluido en los requisitos para plataformas que lo necesiten, pero no es necesario para ejecutar localmente con `python app_medicamentos.py`.
 
 ## Alcance y limitaciones
 
